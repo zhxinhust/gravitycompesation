@@ -1,0 +1,264 @@
+//
+// Created by zhaoxin on 17-10-25.
+//
+#include <iostream>
+#include "myATI.h"
+#include <boost/numpy.hpp>
+
+namespace p = boost::python;
+namespace np = boost::numpy;
+
+int myATI::initATI()
+{
+    //char *calfilepath;      // name of calibration file
+    char *calfilepath = "/home/zhaoxin/Temp/ATI_force_read/src/ATI/src/calibrationfiles/FT20582.cal";      // name of calibration file
+
+    unsigned short index = 1;   // index of calibration in file (second parameter; default = 1)
+    short sts;              // return value from functions
+    int ret;
+    struct tm calDate;
+    int  j;
+    int i;
+    float SampleTT[6]={0,0,0,0,0,0};
+    FILE *biasfile;
+
+    libusb_device_handle *udev2;
+
+    i = 0;
+
+    // 读取力初始值，如果读取文件失败，则将所有值置为零
+    biasfile = fopen("./src/calibrationfiles/forcebias.txt", "r");
+    if(biasfile == NULL)
+    {
+        forcebias[0] = 0;
+        forcebias[1] = 0;
+        forcebias[2] = 0;
+        forcebias[3] = 0;
+        forcebias[4] = 0;
+        forcebias[5] = 0;
+    }
+    else
+    {
+        fscanf(biasfile, "%f, %f, %f, %f, %f, %f", &forcebias[0], &forcebias[1]
+                , &forcebias[2], &forcebias[3]
+                , &forcebias[4], &forcebias[5]);
+        fclose(biasfile);
+    }
+
+    forcebiastemp[0] = 0;
+    forcebiastemp[1] = 0;
+    forcebiastemp[2] = 0;
+    forcebiastemp[3] = 0;
+    forcebiastemp[4] = 0;
+    forcebiastemp[5] = 0;
+
+    start:
+    udev = NULL;
+    udev2 = NULL;
+
+    ret = libusb_init(NULL);
+    if (ret < 0)
+    {
+        perror("usb_device_find_USB_MCC: Failed to initialize libusb");
+        exit(1);
+    }
+
+    if ((udev = usb_device_find_USB_MCC(USB1608FS_PLUS_PID, NULL)))
+    {
+        printf("Success, found a USB 1608FS-Plus!\n");
+    }
+    else
+    {
+        printf("Failure, did not find a USB 1608FS-Plus!\n");
+        return 0;
+    }
+    /******************************** Finding a second device has issues on the Raspberry Pi **************/
+    // See if there is a second device:
+#if defined(LIBUSB_API_VERSION) && (LIBUSB_API_VERSION >= 0x01000103)
+    if ((udev2 = usb_device_find_USB_MCC(USB1608FS_PLUS_PID, NULL)))
+	{
+		printf("Success, found a second USB 1608FS-Plus!\n");
+	}
+	else
+	{
+		printf("Did not find a second device.\n");
+	}
+#endif
+
+    // some initialization
+    //print out the wMaxPacketSize.  Should be 64.
+    printf("wMaxPacketSize = %d\n", usb_get_max_packet_size(udev,0));
+
+    usbBuildGainTable_USB1608FS_Plus(udev, table_AIN);
+    for (i = 0; i < NGAINS_USB1608FS_PLUS; i++ )
+    {
+        for (j = 0; j < NCHAN_USB1608FS_PLUS; j++)
+        {
+            printf("Calibration Table: Range = %d Channel = %d Slope = %f   Offset = %f\n",
+                   i, j, table_AIN[i][j][0], table_AIN[i][j][1]);
+        }
+    }
+    usbCalDate_USB1608FS_Plus(udev, &calDate);
+    printf("\n");
+
+    // create Calibration struct
+    cal = createCalibration(calfilepath, index);
+    if (cal==NULL)
+    {
+        printf("\nSpecified calibration could not be loaded.\n");
+        scanf(".");
+        return 0;
+    }
+    // Set force units.
+    // This step is optional; by default, the units are inherited from the calibration file.
+    sts = SetForceUnits(cal, "N");
+    switch (sts)
+    {
+        case 0: break;	// successful completion
+        case 1: printf("Invalid Calibration struct");
+            return 0;
+        case 2: printf("Invalid force units");
+            return 0;
+        default: printf("Unknown error");
+            return 0;
+    }
+    // Set torque units.
+    // This step is optional; by default, the units are inherited from the calibration file.
+    sts = SetTorqueUnits(cal, "N-m");
+    switch (sts)
+    {
+        case 0: break;	// successful completion
+        case 1: printf("Invalid Calibration struct");
+            return 0;
+        case 2: printf("Invalid torque units");
+            return 0;
+        default: printf("Unknown error");
+            return 0;
+    }
+
+    // Set tool transform.
+    // This line is only required if you want to move or rotate the sensor's coordinate system.
+    // This example tool transform translates the coordinate system 20 mm along the Z-axis
+    // and rotates it 45 degrees about the X-axis.
+    sts = SetToolTransform(cal,SampleTT,"mm","degrees");
+    switch (sts)
+    {
+        case 0: break;	// successful completion
+        case 1: printf("Invalid Calibration struct"); return 0;
+        case 2: printf("Invalid distance units"); return 0;
+        case 3: printf("Invalid angle units"); return 0;
+        default: printf("Unknown error");
+            return 0;
+    }
+}
+
+void myATI::readBias(float *base)
+{
+    int i;
+    int j;
+    int k;
+
+    int nchan;
+    int frequency = 1000;	// 采样频率
+    int ret;
+    uint32_t count = 1;
+    uint16_t sdataIn[8*512]; // holds 16 bit unsigned analog input data
+    uint16_t data;
+    uint8_t range;
+    uint8_t ranges[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    uint8_t channels;
+    float reading[6];
+
+    float F[6];
+
+    nchan = 6;		//  6个通道
+    channels = 0;
+
+    for(i = 0; i < nchan; i++)
+    {
+        channels |= (1 << i);
+    }
+
+    memset(ranges, 0, sizeof(ranges));
+    usbAInScanConfig_USB1608FS_Plus(udev, ranges);
+
+    usbAInScanStart_USB1608FS_Plus(udev, count, frequency, channels, 0);
+
+    ret = usbAInScanRead_USB1608FS_Plus(udev, count, nchan, sdataIn, 0);
+
+    if (ret != count * nchan * 2)
+    {
+        printf("***ERROR***  ret = %d   count = %d  nchan = %d\n", ret, count, nchan);
+    } /* if (ret != count * nchan * 2) */
+
+    for (i = 0; i < count; i++)
+    {
+        for (j = 0; j < nchan; j++)
+        {
+            k = i * nchan + j;
+
+            data = rint(sdataIn[k] * table_AIN[i][j][0] + table_AIN[i][j][1]);
+            *(base + j) = volts_USB1608FS_Plus(data, i);
+        } /* for (j - 0; j < 8, j++) */
+
+    } /* for (i = 0; i < count; i++) */
+
+}
+
+void myATI::biasmeasure()
+{
+    float baseTemp[6];
+    int readTimes = 5000;
+
+    // 先将bias里面的值清零
+    for(int i = 0; i < 6; i++)
+        forcebias[i] = 0;
+
+    std::cout << "reading bias, please wait..." << std::endl;
+    for(int i = 0; i < readTimes; i++)
+    {
+        readBias(baseTemp);
+        for(int j = 0; j < 6; j++)
+            forcebias[j] += baseTemp[j];
+
+        usleep(1000);
+    }
+
+    for(int j = 0; j < 6; j++)
+        forcebias[j] = forcebias[j] / (float) readTimes;
+
+    std::cout << "bias in readed!" << std::endl;
+
+    Bias(cal, forcebias);
+}
+
+void myATI::forcemeasure(float *FT)
+{
+    float reading[6];
+    readBias(reading);
+    ConvertToFT(cal, reading, FT);
+}
+
+//extern "C"
+//{
+//    myATI ATISensor;
+//    void init()
+//    {
+//        ATISensor.initATI();
+//        ATISensor.biasmeasure();
+//    }
+//
+//    void readForce(){};
+//}
+
+
+void initATI()
+{
+
+}
+
+BOOST_PYTHON_MODULE(ur_kin_py) {
+    np::initialize();  // have to put this in any module that uses Boost.NumPy
+    p::def("forward", initATI);
+    //p::def("inverse", inverse_wrapper);
+}
